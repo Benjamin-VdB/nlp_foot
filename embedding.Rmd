@@ -1,0 +1,220 @@
+---
+title: "Foot to vec"
+output: html_notebook
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+library(keras)
+library(openxlsx)
+```
+
+
+Read blog text (chapeau is text, h1 is target)
+
+```{r}
+b_full <- read.xlsx("/home/ben/Documents/data/lequipe2017_18.xlsx")
+
+target <- c()
+text <- c()
+
+for (i in 1:nrow(b_full)) {
+    text <- c(text, b_full[i,"chapeau"])
+    target <- c(target, b_full[i,"h1"])
+}
+```
+
+
+Tokenize
+
+```{r}
+
+maxlen <- 50                 # We will cut reviews after 50 words
+training_samples <- 10000      # We will be training on 7000 samples
+validation_samples <- 5164   # We will be validating on 2656 samples
+max_words <- 10000            # We will only consider the top 10,000 words in the dataset
+
+tokenizer <- text_tokenizer(num_words = max_words) %>% 
+  fit_text_tokenizer(c(text,target))
+
+sequences_text <- texts_to_sequences(tokenizer, text)
+sequences_target <- texts_to_sequences(tokenizer, target)
+
+word_index = tokenizer$word_index
+cat("Found", length(word_index), "unique tokens.\n")
+
+data_text <- pad_sequences(sequences_text, maxlen = maxlen)
+data_target <- pad_sequences(sequences_target, maxlen = maxlen)
+
+cat("Shape of data tensor:", dim(data_text), "\n")
+cat('Shape of target tensor:', dim(data_target), "\n")
+
+# Split the data into a training set and a validation set
+# But first, shuffle the data, since we started from data
+# where sample are ordered (all negative first, then all positive).
+indices <- sample(1:nrow(data_text))
+training_indices <- indices[1:training_samples]
+validation_indices <- indices[(training_samples + 1): 
+                              (training_samples + validation_samples)]
+
+# x_train <- data_text[training_indices,]
+# y_train <- data_target[training_indices,] %>% to_categorical(num_classes = 10000)
+# 
+# x_val <- data_text[validation_indices,]
+# y_val <- data_target[validation_indices,]
+
+
+```
+
+```{r}
+generator <- function(data_text, data_target, lookback, delay, min_index, max_index,
+                      shuffle = FALSE, batch_size = 50, step = 6) {
+  if (is.null(max_index))
+    max_index <- nrow(data)
+  i <- min_index
+  function() {
+      
+    # if (i + batch_size >= max_index)
+    #     i <<- min_index
+    rows <- c(i:min(i+batch_size, max_index))
+    i <<- i + length(rows)
+    
+    # 
+    # samples <- array(0, dim = c(length(rows), 
+    #                             lookback / step,
+    #                             dim(data)[[-1]]))
+    # targets <- array(0, dim = c(length(rows)))
+                     
+    # for (j in 1:length(rows)) {
+    #   indices <- seq(rows[[j]] - lookback, rows[[j]], 
+    #                  length.out = dim(samples)[[2]])
+    #   samples[j,,] <- data[indices,]
+    #   targets[[j]] <- data[rows[[j]] + delay,2]
+    # }            
+    
+    samples <- data_text[rows,]
+    targets <- data_target[rows,] %>% to_categorical(num_classes = max_words)
+    
+    
+    # targets <- data_target[training_indices,] %>% to_categorical(num_classes = 10000)
+    
+    list(samples, targets)
+  }
+}
+
+batch_size=20
+
+train_gen <- generator(
+  data_text = data_text,
+  data_target = data_target,
+  min_index = 1,
+  max_index = 200,
+  batch_size = batch_size
+)
+
+  val_gen <- generator(
+  data_text = data_text,
+  data_target = data_target,
+  min_index = 5001,
+  max_index = 5100,
+  batch_size = batch_size
+)
+
+```
+
+
+
+
+
+Using http://fauconnier.github.io/ embedding of french words
+
+```{r eval=FALSE, include=FALSE}
+# read embedding, dim 500, 1081995 words
+# lines <- readLines("/home/ben/Documents/data/word2vec/frWac_no_postag_phrase_500_cbow_cut10.txt")
+lines <- readLines("/home/ben/Documents/data/word2vec/frWac_non_lem_no_postag_no_phrase_200_skip_cut100.txt")
+
+embeddings_index <- new.env(hash = TRUE, parent = emptyenv())
+
+for (i in 2:(length(lines)-1)) {
+  line <- lines[[i]]
+  values <- strsplit(line, " ")[[1]]
+  word <- values[[1]]
+  embeddings_index[[word]] <- as.double(values[-1])
+}
+
+cat("Found", length(embeddings_index), "word vectors.\n")
+cat("Embedding dimension", length(values)-1)
+
+
+```
+
+Building the embedding layer / matrix for max words found in the training set
+
+```{r}
+embedding_dim <- 200
+max_words <- 10000
+
+embedding_matrix <- array(0, c(max_words, embedding_dim))
+
+for (word in names(word_index)) {
+  index <- word_index[[word]]
+  if (index < max_words) {
+    embedding_vector <- embeddings_index[[word]]
+    if (!is.null(embedding_vector))
+      # Words not found in the embedding index will be all zeros.
+      embedding_matrix[index+1,] <- embedding_vector
+  }
+}
+```
+
+
+```{r}
+model <- keras_model_sequential() %>% 
+  layer_embedding(input_dim = max_words, output_dim = embedding_dim, 
+                  input_length = maxlen) %>%
+  layer_cudnn_lstm(units=embedding_dim, return_sequences=TRUE) %>%
+  layer_cudnn_lstm(units=embedding_dim, return_sequences=TRUE) %>%
+  time_distributed(layer_dense(units=max_words, activation = "softmax"))
+  
+  
+summary(model)
+```
+
+
+
+
+```{r}
+get_layer(model, index = 1) %>% 
+  set_weights(list(embedding_matrix)) %>% 
+  freeze_weights()
+
+summary(model)
+```
+
+```{r}
+optimizer <- optimizer_rmsprop(lr = 0.01)
+
+model %>% compile(
+  loss = "categorical_crossentropy", 
+  optimizer = optimizer
+)   
+
+history <- model %>% fit_generator(
+  train_gen,
+  steps_per_epoch = 10,
+  epochs = 1,
+  validation_data = val_gen,
+  validation_steps = 10,
+  callbacks = list(callback_tensorboard())
+)
+
+```
+```{r}
+plot(history)
+```
+
